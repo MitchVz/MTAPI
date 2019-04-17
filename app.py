@@ -10,10 +10,12 @@
 """
 
 from mtapi import Mtapi
+from pymongo import MongoClient
 from flask import Flask, request, jsonify, render_template, abort
 from flask.json import JSONEncoder
 from datetime import datetime
 from functools import wraps
+import time
 import logging
 import os
 
@@ -32,12 +34,14 @@ if _SETTINGS_ENV_VAR in os.environ:
 elif os.path.isfile(_SETTINGS_DEFAULT_PATH):
     app.config.from_pyfile(_SETTINGS_DEFAULT_PATH)
 else:
-    raise Exception('No configuration found! Create a settings.cfg file or set MTAPI_SETTINGS env variable.')
+    raise Exception(
+        'No configuration found! Create a settings.cfg file or set MTAPI_SETTINGS env variable.')
 
 # set debug logging
 if app.debug:
     logging.basicConfig(level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+                        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
 
 class CustomJSONEncoder(JSONEncoder):
 
@@ -51,6 +55,8 @@ class CustomJSONEncoder(JSONEncoder):
         else:
             return list(iterable)
         return JSONEncoder.default(self, obj)
+
+
 app.json_encoder = CustomJSONEncoder
 
 mta = Mtapi(
@@ -60,6 +66,20 @@ mta = Mtapi(
     max_minutes=app.config['MAX_MINUTES'],
     expires_seconds=app.config['CACHE_SECONDS'],
     threaded=app.config['THREADED'])
+
+client = MongoClient(
+    app.config['MONGODB_URI'],
+    connectTimeoutMS=30000,
+    socketTimeoutMS=None,
+    socketKeepAlive=True)
+
+db = client.get_default_database()
+
+
+def record_connect(json):
+    users_table = db['Users']
+    users_table.insert(json)
+
 
 def cross_origin(f):
     @wraps(f)
@@ -75,13 +95,15 @@ def cross_origin(f):
 
     return decorated_function
 
+
 @app.route('/')
 @cross_origin
 def index():
     return jsonify({
         'title': 'MTAPI',
         'readme': 'Visit https://github.com/jonthornton/MTAPI for more info'
-        })
+    })
+
 
 @app.route('/by-location', methods=['GET'])
 @cross_origin
@@ -92,12 +114,13 @@ def by_location():
         print e
         response = jsonify({
             'error': 'Missing lat/lon parameter'
-            })
+        })
         response.status_code = 400
         return response
 
     data = mta.get_by_point(location, 5)
     return _make_envelope(data)
+
 
 @app.route('/by-route/<route>', methods=['GET'])
 @cross_origin
@@ -107,6 +130,7 @@ def by_route(route):
         return _make_envelope(data)
     except KeyError as e:
         abort(404)
+
 
 @app.route('/by-id/<id_string>', methods=['GET'])
 @cross_origin
@@ -118,13 +142,29 @@ def by_index(id_string):
     except KeyError as e:
         abort(404)
 
+
 @app.route('/routes', methods=['GET'])
 @cross_origin
 def routes():
     return jsonify({
         'data': sorted(mta.get_routes()),
         'updated': mta.last_update()
-        })
+    })
+
+
+@app.route('/connect', methods=['POST'])
+@cross_origin
+def connect():
+    content = request.json
+    timestamp = time.time()
+    time_string = datetime.fromtimestamp(
+        timestamp).strftime('%Y-%m-%d %H:%M:%S')
+    content['timestamp'] = time_string
+    record_connect(content)
+    return jsonify({
+        'success': 'true',
+    })
+
 
 def _envelope_reduce(a, b):
     if a['last_update'] and b['last_update']:
@@ -134,6 +174,7 @@ def _envelope_reduce(a, b):
     else:
         return b
 
+
 def _make_envelope(data):
     time = None
     if data:
@@ -142,7 +183,10 @@ def _make_envelope(data):
     return jsonify({
         'data': data,
         'updated': time
-        })
+    })
+
 
 if __name__ == '__main__':
-    app.run(use_reloader=False)
+    # Bind to PORT if defined, otherwise default to 5000.
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, use_reloader=False)
